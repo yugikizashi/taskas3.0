@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # map_from_txt_leaflet_fileurl_gui_counts.py
 # Be API rakto, be lokalaus serverio (file://).
-# Patobulinta: agreguoja koordinates ir parodo kiek KARTŲ kiekviena vieta buvo užfiksuota.
-# - Ant kiekvieno markerio rodomas "N×"
-# - Viršuje kairėje – suvestinė lentelė (unikalios vietos ir kiekiai, rikiuota mažėjančiai)
+# Agreguoja koordinates ir parodo kiek KARTŲ kiekviena vieta užfiksuota:
+# - Ant markerio: „N×“
+# - Viršuje kairėje: suvestinė lentelė
 
 import re, tempfile, webbrowser, sys
 from pathlib import Path
@@ -51,7 +51,7 @@ def aggregate_coords(coords, precision=5):
 
 def make_leaflet_html(counts_dict, title="Žemėlapis"):
     points = list(counts_dict.items())
-    first = points[0][0] if points else (0,0)
+    first = points[0][0] if points else (0, 0)
 
     markers_js = []
     bounds_points_js = []
@@ -67,20 +67,22 @@ def make_leaflet_html(counts_dict, title="Žemėlapis"):
         )
         bounds_points_js.append(f"[{lat}, {lon}]")
 
+    # ❗️SUKURIAM VIENĄ STRING'Ą PRIEŠ f-STRING
+    markers_combined = "\n".join(markers_js)
+
     if len(points) > 1:
-        fit_js = f"""
-            var bounds = L.latLngBounds([
-                {', '.join(bounds_points_js)}
-            ]);
-            map.fitBounds(bounds);
-        """
+        fit_js = (
+            "var bounds = L.latLngBounds([\n                "
+            + ", ".join(bounds_points_js)
+            + "\n            ]);\n            map.fitBounds(bounds);"
+        )
     else:
         fit_js = f"map.setView([{first[0]}, {first[1]}], 12);"
 
     summary_rows = sorted(points, key=lambda x: x[1], reverse=True)
     summary_html_rows = "\n".join(
         [f"<tr><td>{lat:.5f}, {lon:.5f}</td><td style='text-align:right'>{cnt}×</td></tr>"
-         for (lat,lon), cnt in summary_rows]
+         for (lat, lon), cnt in summary_rows]
     )
     total_visits = sum(cnt for _, cnt in points)
     unique_places = len(points)
@@ -96,7 +98,7 @@ def make_leaflet_html(counts_dict, title="Žemėlapis"):
 html,body,#map {{height:100%;margin:0;padding:0}}
 #map {{height:100vh}}
 .count-tip {{
-  background: #111; color:#fff; border:none; border-radius:6px; padding:2px 6px; font-weight:bold;
+  background:#111;color:#fff;border:none;border-radius:6px;padding:2px 6px;font-weight:bold;
   box-shadow:0 1px 4px rgba(0,0,0,.3);
 }}
 #summary {{
@@ -133,8 +135,6 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
     attribution: '© OpenStreetMap contributors'
 }}).addTo(map);
 
-markers_combined = "\n".join(markers_js)
-...
 {markers_combined}
 
 {fit_js}
@@ -173,14 +173,14 @@ def process_file(path: Path):
     if not coords:
         show_error("Nerasta koordinačių šiame faile.")
         return
-    counts = aggregate_coords(coords, precision=5)
+    counts = aggregate_coords(coords, precision=5)  # keisk 4/6 jei reikia kitokio sugrupavimo
     html = make_leaflet_html(counts, title=path.name)
     out = Path(tempfile.gettempdir()) / "leaflet_map_counts.html"
     out.write_text(html, encoding='utf-8')
     webbrowser.open(out.as_uri())
 
 if __name__ == '__main__':
-    if len(sys.argv)>1:
+    if len(sys.argv) > 1:
         p = Path(sys.argv[1])
         if not p.exists():
             show_error(f"Failas nerastas:\n{p}")
