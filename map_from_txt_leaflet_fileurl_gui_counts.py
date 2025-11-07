@@ -133,7 +133,9 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
     attribution: '© OpenStreetMap contributors'
 }}).addTo(map);
 
-{'\n'.join(markers_js)}
+markers_combined = "\n".join(markers_js)
+...
+{markers_combined}
 
 {fit_js}
 </script>
