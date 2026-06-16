@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # map_from_txt_leaflet_fileurl_gui_counts.py
-# Be API rakto, be lokalaus serverio (file://).
-# Agreguoja koordinates ir parodo kiek KARTŲ kiekviena vieta užfiksuota:
-# - Ant markerio: „N×“
-# - Viršuje kairėje: suvestinė lentelė
 
-import re, tempfile, webbrowser, sys
+import re
+import tempfile
+import webbrowser
+import sys
+import json
 from pathlib import Path
 from collections import defaultdict
 
@@ -15,76 +15,136 @@ try:
 except Exception:
     tk = None
 
-COORD_RE = re.compile(r"([-+]?\d{1,3}\.\d+)")
-PAIR_RE = re.compile(r"([-+]?\d{1,3}\.\d+)\s*[,;\s]\s*([-+]?\d{1,3}\.\d+)")
+# Reguliarūs reiškiniai duomenų ištraukimui
+COORD_RE = re.compile(r"([-+]?\d{1,3}\.\d+)\s*[,;\s]\s*([-+]?\d{1,3}\.\d+)")
+DATE_RE = re.compile(r"(\d{4}[-/.]\d{2}[-/.]\d{2}(?:\s+\d{2}:\d{2}(?:\:\d{2})?)?|\d{2}[-/.]\d{2}[-/.]\d{4}(?:\s+\d{2}:\d{2}(?:\:\d{2})?)?)")
+CELL_RE = re.compile(r"(?:cell\s*id|cid)[:\s=-]*(\d+)", re.IGNORECASE)
 
-def parse_coordinates(text: str):
-    coords = []
-    # 1) tiesioginės poros "lat, lon"
-    for m in PAIR_RE.finditer(text):
-        lat, lon = float(m.group(1)), float(m.group(2))
-        if -90 <= lat <= 90 and -180 <= lon <= 180:
-            coords.append((lat, lon))
-    # 2) "Latitude" / "Longitude"
-    lat_vals = re.findall(r"Latitude[:=\s]*([-+]?\d{1,3}\.\d+)", text, flags=re.IGNORECASE)
-    lon_vals = re.findall(r"Longitude[:=\s]*([-+]?\d{1,3}\.\d+)", text, flags=re.IGNORECASE)
-    if len(lat_vals) == len(lon_vals) and len(lat_vals) > 0:
-        for la, lo in zip(lat_vals, lon_vals):
-            la_f, lo_f = float(la), float(lo)
-            if -90 <= la_f <= 90 and -180 <= lo_f <= 180:
-                coords.append((la_f, lo_f))
-    # 3) seka: lat lon lat lon
-    if not coords:
-        nums = [float(n) for n in COORD_RE.findall(text)]
-        for i in range(0, len(nums)-1, 2):
-            lat, lon = nums[i], nums[i+1]
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
-                coords.append((lat, lon))
-    return coords
+def parse_file_lines(text: str):
+    """
+    Nuskaito tekstą eilutėmis ir bando iš kiekvienos eilutės ištraukti koordinates
+    bei papildomą informaciją (datą, cell id, adresą).
+    """
+    records = []
+    lines = text.splitlines()
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # 1. Ieškome koordinačių eilutėje
+        coord_match = COORD_RE.search(line)
+        if not coord_match:
+            continue
+            
+        lat, lon = float(coord_match.group(1)), float(coord_match.group(2))
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+            
+        # Pašaliname koordinates iš eilutės teksto, kad liktų tik kita info
+        remaining_text = line.replace(coord_match.group(0), "")
+        
+        # 2. Ieškome Datos ir Laiko
+        date_match = DATE_RE.search(remaining_text)
+        date_val = date_match.group(1) if date_match else "Nenurodyta"
+        if date_match:
+            remaining_text = remaining_text.replace(date_match.group(0), "")
+            
+        # 3. Ieškome Cell ID (gali būti keli)
+        cell_ids = CELL_RE.findall(remaining_text)
+        cell_val = ", ".join(cell_ids) if cell_ids else "Nenurodyta"
+        for cid in cell_ids:
+            remaining_text = re.sub(rf"(?:cell\s*id|cid)[:\s=-]*{cid}", "", remaining_text, flags=re.IGNORECASE)
+            
+        # 4. Viskas, kas liko, tikėtina yra Adresas arba papildomas tekstas
+        # Išvalome nereikalingus kablelius, brūkšnius ir tarpus kraštuose
+        address_val = re.sub(r'^[\s,;\-]+|[\s,;\-]+$', '', remaining_text).strip()
+        if not address_val:
+            address_val = "Nenurodytas"
+            
+        records.append({
+            "lat": round(lat, 5),
+            "lon": round(lon, 5),
+            "date": date_val,
+            "cell_id": cell_val,
+            "address": address_val
+        })
+        
+    return records
 
-def aggregate_coords(coords, precision=5):
-    counts = defaultdict(int)
-    for lat, lon in coords:
-        key = (round(lat, precision), round(lon, precision))
-        counts[key] += 1
-    return dict(counts)
+def aggregate_records(records):
+    """
+    Sugrupuoja įrašus pagal unikalias koordinates ir surenka jų istoriją.
+    """
+    aggregated = defaultdict(lambda: {"count": 0, "details": [], "addresses": set()})
+    
+    for r in records:
+        key = (r["lat"], r["lon"])
+        aggregated[key]["count"] += 1
+        aggregated[key]["details"].append({
+            "date": r["date"],
+            "cell_id": r["cell_id"]
+        })
+        if r["address"] != "Nenurodytas":
+            aggregated[key]["addresses"].add(r["address"])
+            
+    # Paverčiame adresų rinkinius į tekstą
+    for key in aggregated:
+        if aggregated[key]["addresses"]:
+            aggregated[key]["main_address"] = " | ".join(aggregated[key]["addresses"])
+        else:
+            aggregated[key]["main_address"] = "Nenurodytas adresas"
+            
+    return aggregated
 
-def make_leaflet_html(counts_dict, title="Žemėlapis"):
-    points = list(counts_dict.items())
+def make_leaflet_html(aggregated_data, title="Žemėlapis"):
+    points = list(aggregated_data.items())
     first = points[0][0] if points else (0, 0)
 
     markers_js = []
     bounds_points_js = []
-    for (lat, lon), cnt in points:
+    
+    for (lat, lon), info in points:
+        cnt = info["count"]
+        addr = info["main_address"].replace("'", "\\'") # Apsauga nuo JS klaidų
+        
+        # Sukuriame HTML lentelę markerio popup'ui su datomis ir Cell ID
+        popup_html = f"<b>{addr}</b><br><small>{lat}, {lon}</small><br><br>"
+        popup_html += "<table style='font-size:11px; border-collapse:collapse; width:100%;'>"
+        popup_html += "<tr style='border-bottom:1px solid #ccc;'><th>Data/Laikas</th><th>Cell ID</th></tr>"
+        
+        for det in info["details"]:
+            popup_html += f"<tr><td style='padding:2px 4px;'>{det['date']}</td><td style='padding:2px 4px;'>{det['cell_id']}</td></tr>"
+        popup_html += f"</table><br><b>Viso apsilankymų: {cnt}×</b>"
+
         markers_js.append(
             f"""
             (function() {{
                 var m = L.marker([{lat}, {lon}]).addTo(map);
-                m.bindPopup('{lat}, {lon}<br><b>{cnt}×</b>');
+                m.bindPopup('{popup_html}', {{maxWidth: 300}});
                 m.bindTooltip('{cnt}×', {{permanent: true, direction: 'top', className: 'count-tip'}});
             }})();
             """
         )
         bounds_points_js.append(f"[{lat}, {lon}]")
 
-    # ❗️SUKURIAM VIENĄ STRING'Ą PRIEŠ f-STRING
     markers_combined = "\n".join(markers_js)
 
     if len(points) > 1:
-        fit_js = (
-            "var bounds = L.latLngBounds([\n                "
-            + ", ".join(bounds_points_js)
-            + "\n            ]);\n            map.fitBounds(bounds);"
-        )
+        fit_js = "var bounds = L.latLngBounds([\n" + ", ".join(bounds_points_js) + "\n]);\nmap.fitBounds(bounds);"
     else:
         fit_js = f"map.setView([{first[0]}, {first[1]}], 12);"
 
-    summary_rows = sorted(points, key=lambda x: x[1], reverse=True)
-    summary_html_rows = "\n".join(
-        [f"<tr><td>{lat:.5f}, {lon:.5f}</td><td style='text-align:right'>{cnt}×</td></tr>"
-         for (lat, lon), cnt in summary_rows]
-    )
-    total_visits = sum(cnt for _, cnt in points)
+    summary_rows = sorted(points, key=lambda x: x[1]["count"], reverse=True)
+    summary_html_rows = ""
+    for (lat, lon), info in summary_rows:
+        addr_short = info["main_address"]
+        if len(addr_short) > 25:
+            addr_short = addr_short[:22] + "..."
+        summary_html_rows += f"<tr><td><span title='{info['main_address']}'>{addr_short}</span><br><small style='color:#666'>{lat:.5f}, {lon:.5f}</small></td><td style='text-align:right; vertical-align:middle;'>{info['count']}×</td></tr>"
+
+    total_visits = sum(info["count"] for _, info in points)
     unique_places = len(points)
 
     html = f"""<!doctype html>
@@ -103,14 +163,15 @@ html,body,#map {{height:100%;margin:0;padding:0}}
 }}
 #summary {{
   position:absolute; top:10px; left:10px; z-index:1000;
-  background: rgba(255,255,255,.92); padding:10px; border-radius:10px;
-  max-height: 60vh; overflow:auto; box-shadow:0 2px 10px rgba(0,0,0,.2);
-  font: 14px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  background: rgba(255,255,255,.95); padding:12px; border-radius:10px;
+  max-height: 75vh; overflow:auto; box-shadow:0 2px 10px rgba(0,0,0,.2);
+  font: 13px/1.4 system-ui, -apple-system, sans-serif;
+  width: 280px;
 }}
-#summary table {{ border-collapse: collapse; }}
-#summary th, #summary td {{ padding:4px 8px; border-bottom:1px solid #eee; }}
-#summary h3 {{ margin:0 0 6px 0; font-size:16px; }}
-#summary .small {{ color:#555; font-size:12px; margin-bottom:6px; }}
+#summary table {{ border-collapse: collapse; width:100%; }}
+#summary th, #summary td {{ padding:6px 4px; border-bottom:1px solid #eee; text-align:left; }}
+#summary h3 {{ margin:0 0 4px 0; font-size:15px; }}
+#summary .small {{ color:#555; font-size:11px; margin-bottom:8px; }}
 </style>
 </head>
 <body>
@@ -118,9 +179,9 @@ html,body,#map {{height:100%;margin:0;padding:0}}
 
 <div id="summary">
   <h3>Suvestinė</h3>
-  <div class="small">Unikalių vietų: <b>{unique_places}</b> · Viso apsilankymų: <b>{total_visits}</b></div>
+  <div class="small">Unikalių vietų: <b>{unique_places}</b> · Įrašų viso: <b>{total_visits}</b></div>
   <table>
-    <thead><tr><th>Koordinatės</th><th>Kartai</th></tr></thead>
+    <thead><tr><th>Vieta / Koordinatės</th><th style='text-align:right'>Kartai</th></tr></thead>
     <tbody>
       {summary_html_rows}
     </tbody>
@@ -149,8 +210,8 @@ def choose_file_dialog():
         return None
     root = tk.Tk(); root.withdraw()
     path = filedialog.askopenfilename(
-        title="Pasirink .txt failą su koordinatėmis",
-        filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        title="Pasirink failą su koordinatėmis ir informacija",
+        filetypes=[("Tekstiniai failai", "*.txt *.csv"), ("Visi failai", "*.*")]
     )
     root.destroy()
     return path
@@ -169,13 +230,16 @@ def process_file(path: Path):
     except Exception as e:
         show_error(f"Nepavyko perskaityti failo:\n{e}")
         return
-    coords = parse_coordinates(text)
-    if not coords:
-        show_error("Nerasta koordinačių šiame faile.")
+        
+    records = parse_file_lines(text)
+    if not records:
+        show_error("Nerasta koordinačių ar tinkamų duomenų šiame faile.")
         return
-    counts = aggregate_coords(coords, precision=5)  # keisk 4/6 jei reikia kitokio sugrupavimo
-    html = make_leaflet_html(counts, title=path.name)
-    out = Path(tempfile.gettempdir()) / "leaflet_map_counts.html"
+        
+    aggregated_data = aggregate_records(records)
+    html = make_leaflet_html(aggregated_data, title=path.name)
+    
+    out = Path(tempfile.gettempdir()) / "leaflet_map_advanced.html"
     out.write_text(html, encoding='utf-8')
     webbrowser.open(out.as_uri())
 
