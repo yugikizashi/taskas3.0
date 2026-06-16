@@ -20,11 +20,18 @@ COORD_RE = re.compile(r"([-+]?\d{1,3}\.\d+)\s*[,;\s]\s*([-+]?\d{1,3}\.\d+)")
 DATE_RE = re.compile(r"(\d{4}[-/.]\d{2}[-/.]\d{2}(?:\s+\d{2}:\d{2}(?:\:\d{2})?)?|\d{2}[-/.]\d{2}[-/.]\d{4}(?:\s+\d{2}:\d{2}(?:\:\d{2})?)?)")
 CELL_RE = re.compile(r"(?:cell\s*id|cid)[:\s=-]*(\d+)", re.IGNORECASE)
 
+def safe_js_string(text: str) -> str:
+    """Išvalo tekstą nuo bet kokių simbolių, galinčių sulaužyti JavaScript."""
+    if not text:
+        return ""
+    # Pašaliname abiejų rūšių kabutes ir backslash'us
+    text = text.replace("\\", "/").replace("'", "").replace('"', "")
+    # Pašaliname eilutės perkėlimus, kad JS neskaitytų kaip nebaigtos eilutės
+    text = text.replace("\n", " ").replace("\r", " ")
+    return text.strip()
+
 def parse_file_lines(text: str):
-    """
-    Nuskaito tekstą eilutėmis ir bando iš kiekvienos eilutės ištraukti koordinates
-    bei papildomą informaciją (datą, cell id, adresą).
-    """
+    """Nuskaito tekstą eilutėmis ir ištraukia koordinates bei info."""
     records = []
     lines = text.splitlines()
     
@@ -33,7 +40,7 @@ def parse_file_lines(text: str):
         if not line:
             continue
             
-        # 1. Ieškome koordinačių eilutėje
+        # 1. Ieškome koordinačių
         coord_match = COORD_RE.search(line)
         if not coord_match:
             continue
@@ -42,26 +49,25 @@ def parse_file_lines(text: str):
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             continue
             
-        # Pašaliname koordinates iš eilutės teksto, kad liktų tik kita info
         remaining_text = line.replace(coord_match.group(0), "")
         
         # 2. Ieškome Datos ir Laiko
         date_match = DATE_RE.search(remaining_text)
-        date_val = date_match.group(1) if date_match else "Nenurodyta"
+        date_val = safe_js_string(date_match.group(1)) if date_match else "Nenurodyta"
         if date_match:
             remaining_text = remaining_text.replace(date_match.group(0), "")
             
-        # 3. Ieškome Cell ID (gali būti keli)
+        # 3. Ieškome Cell ID
         cell_ids = CELL_RE.findall(remaining_text)
-        cell_val = ", ".join(cell_ids) if cell_ids else "Nenurodyta"
+        cell_val = safe_js_string(", ".join(cell_ids)) if cell_ids else "Nenurodyta"
         for cid in cell_ids:
             remaining_text = re.sub(rf"(?:cell\s*id|cid)[:\s=-]*{cid}", "", remaining_text, flags=re.IGNORECASE)
             
-        # 4. Viskas, kas liko, tikėtina yra Adresas arba papildomas tekstas
-        # Išvalome nereikalingus kablelius, brūkšnius ir tarpus kraštuose
+        # 4. Adresas (viskas, kas liko)
         address_val = re.sub(r'^[\s,;\-]+|[\s,;\-]+$', '', remaining_text).strip()
+        address_val = safe_js_string(address_val)
         if not address_val:
-            address_val = "Nenurodytas"
+            address_val = "Nenurodytas adresas"
             
         records.append({
             "lat": round(lat, 5),
@@ -74,9 +80,7 @@ def parse_file_lines(text: str):
     return records
 
 def aggregate_records(records):
-    """
-    Sugrupuoja įrašus pagal unikalias koordinates ir surenka jų istoriją.
-    """
+    """Sugrupuoja įrašus pagal unikalias koordinates."""
     aggregated = defaultdict(lambda: {"count": 0, "details": [], "addresses": set()})
     
     for r in records:
@@ -86,13 +90,12 @@ def aggregate_records(records):
             "date": r["date"],
             "cell_id": r["cell_id"]
         })
-        if r["address"] != "Nenurodytas":
+        if r["address"] and r["address"] != "Nenurodytas adresas":
             aggregated[key]["addresses"].add(r["address"])
             
-    # Paverčiame adresų rinkinius į tekstą
     for key in aggregated:
         if aggregated[key]["addresses"]:
-            aggregated[key]["main_address"] = " | ".join(aggregated[key]["addresses"])
+            aggregated[key]["main_address"] = " | ".join(sorted(list(aggregated[key]["addresses"])))
         else:
             aggregated[key]["main_address"] = "Nenurodytas adresas"
             
@@ -107,22 +110,25 @@ def make_leaflet_html(aggregated_data, title="Žemėlapis"):
     
     for (lat, lon), info in points:
         cnt = info["count"]
-        addr = info["main_address"].replace("'", "\\'") # Apsauga nuo JS klaidų
+        addr = info["main_address"]
         
-        # Sukuriame HTML lentelę markerio popup'ui su datomis ir Cell ID
+        # Sukuriame popup HTML turinį saugiai
         popup_html = f"<b>{addr}</b><br><small>{lat}, {lon}</small><br><br>"
         popup_html += "<table style='font-size:11px; border-collapse:collapse; width:100%;'>"
-        popup_html += "<tr style='border-bottom:1px solid #ccc;'><th>Data/Laikas</th><th>Cell ID</th></tr>"
+        popup_html += "<tr style='border-bottom:1px solid #ccc; text-align:left;'><th>Data/Laikas</th><th>Cell ID</th></tr>"
         
         for det in info["details"]:
             popup_html += f"<tr><td style='padding:2px 4px;'>{det['date']}</td><td style='padding:2px 4px;'>{det['cell_id']}</td></tr>"
         popup_html += f"</table><br><b>Viso apsilankymų: {cnt}×</b>"
 
+        # Naudojame json.dumps, kad visiškai apsisaugotume nuo JS klaidų perduodant tekstą
+        safe_popup_html = json.dumps(popup_html)
+
         markers_js.append(
             f"""
             (function() {{
                 var m = L.marker([{lat}, {lon}]).addTo(map);
-                m.bindPopup('{popup_html}', {{maxWidth: 300}});
+                m.bindPopup({safe_popup_html}, {{maxWidth: 300}});
                 m.bindTooltip('{cnt}×', {{permanent: true, direction: 'top', className: 'count-tip'}});
             }})();
             """
@@ -233,7 +239,7 @@ def process_file(path: Path):
         
     records = parse_file_lines(text)
     if not records:
-        show_error("Nerasta koordinačių ar tinkamų duomenų šiame faile.")
+        show_error("Nerasta koordinačių ar tinkamų duomenų šiame faile.\nPatikrinkite, ar faile yra skaičiai formatu: 54.1234, 25.1234")
         return
         
     aggregated_data = aggregate_records(records)
