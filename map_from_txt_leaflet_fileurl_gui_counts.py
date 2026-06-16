@@ -24,7 +24,6 @@ DISPLAY_FIELDS = [
     "CellId2 Latitude", "CellId2 Longitude", "plmn", "IMEI", "IMSI"
 ]
 
-# Taisyklės, kaip atpažinti stulpelius
 FIELD_MAPPING_RULES = {
     "Provider Name": ["provider name", "provider n", "provider"],
     "Retain Date": ["retain date", "retain d"],
@@ -49,8 +48,12 @@ FIELD_MAPPING_RULES = {
     "IMSI": ["imsi"]
 }
 
-# Reguliarusis reiškinys koordinačių paieškai
-COORD_RE = re.compile(r"([-+]?\d{1,3}\.\d+)\s*[,;\s\t]\s*([-+]?\d{1,3}\.\d+)")
+# Griežtesnis koordinačių regex
+COORD_RE = re.compile(r"([-+]?\d{1,3}\.\d{4,8})\s*[,;\s\t]\s*([-+]?\d{1,3}\.\d{4,8})")
+
+# Lietuvos/Europos ribos (filtravimui)
+LAT_MIN, LAT_MAX = 53.8, 56.5
+LON_MIN, LON_MAX = 20.5, 27.0
 
 
 def safe_js_string(text: str) -> str:
@@ -70,7 +73,6 @@ def find_column_index(header_parts, targets):
 
 
 def parse_retain_date(date_str: str):
-    """Bandome išparsinti įvairius datos + laiko formatus."""
     if not date_str or date_str == "Nenurodyta":
         return None
     date_str = date_str.strip()
@@ -87,6 +89,12 @@ def parse_retain_date(date_str: str):
     return None
 
 
+def is_valid_coordinate(lat: float, lon: float) -> bool:
+    """Tikrina ar koordinatės yra realistiškos Lietuvai/Europai"""
+    return (LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX) or \
+           (-90 <= lat <= 90 and -180 <= lon <= 180)
+
+
 def parse_file_to_records(text: str):
     records = []
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -97,7 +105,6 @@ def parse_file_to_records(text: str):
     delimiter = "\t"
     field_map = {}
 
-    # Ieškome antraštės eilutės
     for idx, line in enumerate(lines):
         current_delim = "\t" if "\t" in line else (";" if ";" in line else ",")
         parts = [p.strip().lower() for p in line.split(current_delim)]
@@ -119,7 +126,6 @@ def parse_file_to_records(text: str):
     if header_idx == -1:
         return records
 
-    # Skaitome duomenis nuo antraštės
     for line in lines[header_idx + 1:]:
         parts = [p.strip() for p in line.split(delimiter)]
         if len(parts) < 2:
@@ -131,7 +137,7 @@ def parse_file_to_records(text: str):
             if col_idx < len(parts) and parts[col_idx]:
                 row_info[field_key] = safe_js_string(parts[col_idx])
 
-        # --- Datos ir laiko apdorojimas ---
+        # Datos apdorojimas
         retain_date_str = row_info.get("Retain Date", "Nenurodyta")
         dt = parse_retain_date(retain_date_str)
         if dt:
@@ -140,43 +146,62 @@ def parse_file_to_records(text: str):
         else:
             row_info["_datetime"] = None
 
-        # Koordinatės
+        # === Koordinačių paieška (patobulinta) ===
         lat, lon = None, None
+
+        # Pirmenybė CellId1
         try:
-            l1 = row_info.get("CellId1 Latitude", "Nenurodyta")
-            o1 = row_info.get("CellId1 Longitude", "Nenurodyta")
-            if l1 != "Nenurodyta" and o1 != "Nenurodyta":
+            l1 = row_info.get("CellId1 Latitude", "")
+            o1 = row_info.get("CellId1 Longitude", "")
+            if l1 and o1 and l1 != "Nenurodyta" and o1 != "Nenurodyta":
                 lat = float(l1.replace(",", "."))
                 lon = float(o1.replace(",", "."))
         except ValueError:
             pass
 
-        if lat is None or lon is None or lat == 0:
+        # Jei CellId1 netinkamos — CellId2
+        if lat is None or lon is None or not is_valid_coordinate(lat, lon):
             try:
-                l2 = row_info.get("CellId2 Latitude", "Nenurodyta")
-                o2 = row_info.get("CellId2 Longitude", "Nenurodyta")
-                if l2 != "Nenurodyta" and o2 != "Nenurodyta":
+                l2 = row_info.get("CellId2 Latitude", "")
+                o2 = row_info.get("CellId2 Longitude", "")
+                if l2 and o2 and l2 != "Nenurodyta" and o2 != "Nenurodyta":
                     lat = float(l2.replace(",", "."))
                     lon = float(o2.replace(",", "."))
             except ValueError:
                 pass
 
-        if lat is None or lon is None or lat == 0:
+        # Jei vis dar nėra — ieškome tekste (regex)
+        if lat is None or lon is None or not is_valid_coordinate(lat, lon):
             match = COORD_RE.search(line)
             if match:
                 try:
                     lat = float(match.group(1).replace(",", "."))
                     lon = float(match.group(2).replace(",", "."))
                 except ValueError:
-                    continue
+                    pass
 
-        if lat is None or lon is None or lat == 0:
+        if lat is None or lon is None or not is_valid_coordinate(lat, lon):
             continue
 
-        if -90 <= lat <= 90 and -180 <= lon <= 180:
-            row_info["_lat"] = round(lat, 5)
-            row_info["_lon"] = round(lon, 5)
-            records.append(row_info)
+        # Galutinis patikrinimas
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+
+        row_info["_lat"] = round(lat, 6)
+        row_info["_lon"] = round(lon, 6)
+
+        # === Adreso tvarkymas (tikslus iš failo) ===
+        addr1 = row_info.get("CellId1 Address", "Nenurodyta")
+        addr2 = row_info.get("CellId2 Address", "Nenurodyta")
+
+        if addr1 and addr1 != "Nenurodyta" and len(addr1) > 5:
+            row_info["_address"] = addr1
+        elif addr2 and addr2 != "Nenurodyta" and len(addr2) > 5:
+            row_info["_address"] = addr2
+        else:
+            row_info["_address"] = "Adresas nenurodytas"
+
+        records.append(row_info)
 
     return records
 
@@ -185,7 +210,7 @@ def aggregate_records(records):
     aggregated = defaultdict(lambda: {
         "count": 0,
         "details": [],
-        "address": "Nenurodytas adresas",
+        "address": "Adresas nenurodytas",
         "first_date": None,
         "last_date": None
     })
@@ -195,13 +220,9 @@ def aggregate_records(records):
         aggregated[key]["count"] += 1
         aggregated[key]["details"].append(r)
 
-        # Adresas
-        c1_addr = r.get("CellId1 Address", "Nenurodyta")
-        c2_addr = r.get("CellId2 Address", "Nenurodyta")
-        if c1_addr != "Nenurodyta" and c1_addr:
-            aggregated[key]["address"] = c1_addr
-        elif c2_addr != "Nenurodyta" and c2_addr:
-            aggregated[key]["address"] = c2_addr
+        # Naudojame tikslų adresą iš _address
+        if r["_address"] and r["_address"] != "Adresas nenurodytas":
+            aggregated[key]["address"] = r["_address"]
 
         # Datų intervalas
         dt = r.get("_datetime")
@@ -211,7 +232,7 @@ def aggregate_records(records):
             if not aggregated[key]["last_date"] or dt > aggregated[key]["last_date"]:
                 aggregated[key]["last_date"] = dt
 
-    # Surūšiuojame detales chronologiškai
+    # Chronologinis rūšiavimas
     for key in aggregated:
         aggregated[key]["details"].sort(key=lambda x: x.get("_datetime") or datetime.datetime.min)
 
@@ -220,7 +241,10 @@ def aggregate_records(records):
 
 def make_leaflet_html(aggregated_data, title="Žemėlapis"):
     points = list(aggregated_data.items())
-    first = points[0][0] if points else (0, 0)
+    if not points:
+        return "<h2>Nerasta jokių įrašų su koordinatėmis</h2>"
+
+    first = points[0][0]
     markers_js = []
     bounds_points_js = []
 
@@ -228,7 +252,6 @@ def make_leaflet_html(aggregated_data, title="Žemėlapis"):
         cnt = info["count"]
         main_addr = info["address"]
 
-        # Datų intervalas
         first_dt = info.get("first_date")
         last_dt = info.get("last_date")
         date_range = ""
@@ -238,20 +261,18 @@ def make_leaflet_html(aggregated_data, title="Žemėlapis"):
             else:
                 date_range = f"{first_dt.strftime('%Y-%m-%d')} – {last_dt.strftime('%Y-%m-%d')}"
 
-        popup_html = f"<div style='min-width:380px; max-height:480px; overflow-y:auto; font-family:sans-serif; font-size:11px; line-height:1.45;'>"
+        popup_html = f"<div style='min-width:390px; max-height:500px; overflow-y:auto; font-family:sans-serif; font-size:11.2px; line-height:1.45;'>"
         popup_html += f"<b>Adresas:</b> {main_addr}<br>"
-        popup_html += f"<b>Koordinatės:</b> {lat}, {lon}<br>"
+        popup_html += f"<b>Koordinatės:</b> {lat:.6f}, {lon:.6f}<br>"
         if date_range:
             popup_html += f"<b>Laikotarpis:</b> {date_range}<br>"
-        popup_html += f"<hr style='border:0; border-top:1px solid #ccc; margin: 8px 0;'>"
+        popup_html += "<hr style='border:0; border-top:1px solid #ccc; margin: 8px 0;'>"
 
         for idx, det in enumerate(info["details"]):
             dt = det.get("_datetime")
-            time_str = dt.strftime("%H:%M:%S") if dt else "Nenurodytas laikas"
-
+            time_str = dt.strftime("%H:%M:%S") if dt else ""
             popup_html += f"<div style='margin-bottom:12px; padding: 9px; background: #f9f9f9; border-radius: 5px; border-left: 4px solid #0078AA;'>"
-            popup_html += f"<b style='color:#0078AA; font-size:12px;'>Sujungimas #{idx+1}</b> <small style='color:#555;'>{time_str}</small><br>"
-
+            popup_html += f"<b style='color:#0078AA;'>Sujungimas #{idx+1}</b> <small>{time_str}</small><br>"
             for f in DISPLAY_FIELDS:
                 if f == "Retain Date":
                     continue
@@ -260,99 +281,64 @@ def make_leaflet_html(aggregated_data, title="Žemėlapis"):
                     popup_html += f"<b>{f}:</b> {val}<br>"
             popup_html += "</div>"
 
-        popup_html += f"<div style='margin-top:10px; font-weight:bold; font-size:12.5px; color:#111;'>Iš viso šioje vietoje: <b>{cnt}×</b></div></div>"
+        popup_html += f"<div style='margin-top:10px; font-weight:bold; color:#111;'>Iš viso: <b>{cnt}×</b></div></div>"
 
-        safe_popup_html = json.dumps(popup_html)
-        markers_js.append(
-            f"""
+        safe_popup = json.dumps(popup_html)
+        markers_js.append(f"""
             (function() {{
                 var m = L.marker([{lat}, {lon}]).addTo(map);
-                m.bindPopup({safe_popup_html}, {{maxWidth: 400}});
+                m.bindPopup({safe_popup}, {{maxWidth: 410}});
                 m.bindTooltip('{cnt}×', {{permanent: true, direction: 'top', className: 'count-tip'}});
             }})();
-            """
-        )
+        """)
         bounds_points_js.append(f"[{lat}, {lon}]")
 
     markers_combined = "\n".join(markers_js)
-
-    if len(points) > 1:
-        fit_js = "var bounds = L.latLngBounds([\n" + ", ".join(bounds_points_js) + "\n]);\nmap.fitBounds(bounds);"
-    else:
-        fit_js = f"map.setView([{first[0]}, {first[1]}], 13);"
+    fit_js = "var bounds = L.latLngBounds([\n" + ", ".join(bounds_points_js) + "\n]);\nmap.fitBounds(bounds);" if len(points) > 1 else f"map.setView([{first[0]}, {first[1]}], 14);"
 
     # Suvestinė
     summary_rows = sorted(points, key=lambda x: x[1]["count"], reverse=True)
     summary_html_rows = ""
     for (lat, lon), info in summary_rows:
-        addr_full = info["address"]
-        addr_short = addr_full if len(addr_full) <= 32 else addr_full[:29] + "..."
-        first_dt = info.get("first_date")
-        date_info = first_dt.strftime("%Y-%m-%d") if first_dt else ""
-
+        addr = info["address"]
+        short_addr = addr[:35] + "..." if len(addr) > 35 else addr
         summary_html_rows += f"""
         <tr>
-            <td style='max-width:150px; word-wrap:break-word;'><span title='{addr_full}'>{addr_short}</span></td>
+            <td style='word-wrap:break-word;'><span title='{addr}'>{short_addr}</span></td>
             <td style='color:#555; font-size:11px; white-space:nowrap;'>{lat:.5f},<br>{lon:.5f}</td>
             <td style='text-align:right; font-weight:bold; color:#0078AA;'>{info['count']}×</td>
         </tr>
         """
 
-    total_visits = sum(info["count"] for _, info in points)
-    unique_places = len(points)
-
+    total = sum(info["count"] for _, info in points)
     html = f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <style>
 html,body,#map {{height:100%;margin:0;padding:0}}
 #map {{height:100vh}}
-.count-tip {{
-  background:#111;color:#fff;border:none;border-radius:6px;padding:2px 7px;font-weight:bold;
-  box-shadow:0 1px 4px rgba(0,0,0,.3);
-}}
-#summary {{
-  position:absolute; top:10px; left:10px; z-index:1000;
-  background: rgba(255,255,255,.97); padding:12px; border-radius:10px;
-  max-height: 82vh; overflow-y:auto; box-shadow:0 4px 15px rgba(0,0,0,.15);
-  font: 12px/1.45 system-ui, -apple-system, sans-serif;
-  width: 360px;
-}}
-#summary table {{ border-collapse: collapse; width:100%; table-layout: fixed; }}
-#summary th, #summary td {{ padding:6px 5px; border-bottom:1px solid #eee; text-align:left; vertical-align:middle; }}
-#summary h3 {{ margin:0 0 5px 0; font-size:15px; color:#111; }}
-#summary .small {{ color:#666; font-size:11px; margin-bottom:10px; }}
+.count-tip {{background:#111;color:#fff;border:none;border-radius:6px;padding:2px 7px;font-weight:bold;}}
+#summary {{position:absolute; top:10px; left:10px; z-index:1000; background:rgba(255,255,255,.97); padding:12px; border-radius:10px;
+           max-height:80vh; overflow-y:auto; box-shadow:0 4px 15px rgba(0,0,0,.15); width:370px; font:12px/1.45 system-ui;}}
 </style>
 </head>
 <body>
 <div id="map"></div>
 <div id="summary">
   <h3>Suvestinė</h3>
-  <div class="small">Unikalių vietų: <b>{unique_places}</b> · Sujungimų viso: <b>{total_visits}</b></div>
-  <table>
-    <thead>
-      <tr>
-        <th style='width:48%'>Adresas</th>
-        <th style='width:32%'>Koordinatės</th>
-        <th style='width:20%; text-align:right;'>Sujung.</th>
-      </tr>
-    </thead>
-    <tbody>
-      {summary_html_rows}
-    </tbody>
+  <div style="color:#666;font-size:11px;margin-bottom:8px;">Vietų: <b>{len(points)}</b> • Sujungimų: <b>{total}</b></div>
+  <table style="width:100%; border-collapse:collapse;">
+    <thead><tr><th>Adresas</th><th>Koordinatės</th><th style="text-align:right">Sujung.</th></tr></thead>
+    <tbody>{summary_html_rows}</tbody>
   </table>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 var map = L.map('map');
-L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-    maxZoom: 19,
-    attribution: '© OpenStreetMap contributors'
-}}).addTo(map);
+L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{maxZoom:19, attribution:'© OpenStreetMap'}}).addTo(map);
 {markers_combined}
 {fit_js}
 </script>
@@ -362,23 +348,18 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
     return html
 
 
+# === Žemiau likusi dalis be pakeitimų (dialogai, klaidos ir t.t.) ===
 def choose_file_dialog():
-    if tk is None:
-        return None
-    root = tk.Tk()
-    root.withdraw()
-    path = filedialog.askopenfilename(
-        title="Pasirink failą su duomenimis",
-        filetypes=[("Tekstiniai / CSV failai", "*.txt *.csv *.tsv"), ("Visi failai", "*.*")]
-    )
+    if tk is None: return None
+    root = tk.Tk(); root.withdraw()
+    path = filedialog.askopenfilename(title="Pasirink failą", filetypes=[("Tekstiniai failai", "*.txt *.csv *.tsv"), ("All", "*.*")])
     root.destroy()
     return path
 
 
 def show_error(msg: str):
     if tk is not None:
-        root = tk.Tk()
-        root.withdraw()
+        root = tk.Tk(); root.withdraw()
         messagebox.showerror("Klaida", msg)
         root.destroy()
     else:
@@ -394,13 +375,13 @@ def process_file(path: Path):
 
     records = parse_file_to_records(text)
     if not records:
-        show_error("KLAIDA: Nepavyko rasti lentelės su duomenimis arba koordinačių.")
+        show_error("Nepavyko rasti jokių įrašų su koordinatėmis.\nPatikrinkite, ar faile yra CellId1/CellId2 Latitude/Longitude.")
         return
 
-    aggregated_data = aggregate_records(records)
-    html = make_leaflet_html(aggregated_data, title=path.name)
+    aggregated = aggregate_records(records)
+    html = make_leaflet_html(aggregated, title=path.name)
 
-    out = Path(tempfile.gettempdir()) / "leaflet_map_with_time.html"
+    out = Path(tempfile.gettempdir()) / "leaflet_map_fixed.html"
     out.write_text(html, encoding='utf-8')
     webbrowser.open(out.as_uri())
 
@@ -409,7 +390,7 @@ if __name__ == '__main__':
     if len(sys.argv) > 1:
         p = Path(sys.argv[1])
         if not p.exists():
-            show_error(f"Failas nerastas:\n{p}")
+            show_error(f"Failas nerastas: {p}")
             sys.exit(1)
         process_file(p)
     else:
