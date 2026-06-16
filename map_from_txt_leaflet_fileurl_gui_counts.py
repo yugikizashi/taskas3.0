@@ -15,7 +15,7 @@ try:
 except Exception:
     tk = None
 
-# Pilni ir tikslūs stulpelių pavadinimai iš tavo pateiktos naujos nuotraukos
+# Tikslūs stulpelių pavadinimai iš tavo pateiktos nuotraukos
 FIELDS = [
     "Provider Name", "Retain Date", "aParty Number", "bParty Number", 
     "Dialed Number", "Duration", "Service Type", "Service", 
@@ -24,77 +24,72 @@ FIELDS = [
     "CellId2 Latitude", "CellId2 Longitude", "plmn", "IMEI", "IMSI"
 ]
 
-# Reguliarus reiškinys koordinatėms surasti teksto eilutėje (jei nuskaitoma kaip laisvas tekstas)
-COORD_RE = re.compile(r"([-+]?\d{1,3}\.\d+)\s*[,;\s\t]\s*([-+]?\d{1,3}\.\d+)")
-
 def safe_js_string(text: str) -> str:
-    """Išvalo tekstą nuo bet kokių simbolių, galinčių sugadinti JavaScript."""
+    """Išvalo tekstą, kad jis nesulaužytų žemėlapio kodo."""
     if not text:
         return ""
     text = str(text).replace("\\", "/").replace("'", "").replace('"', "")
-    text = text.replace("\n", " ").replace("\r", " ")
     return text.strip()
 
 def parse_file_to_records(text: str):
-    """Analizuoja failą eilutėmis. Ieško koordinačių ir nurodytų laukų."""
+    """Protingas failo nuskaitymas, palaikantis Tab, kablelio ir kabliataškio skirtukus."""
     records = []
-    lines = text.splitlines()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         return records
 
-    # Paruošiame antraštę palyginimui, išvalydami tarpus
-    header = [f.strip().lower() for f in re.split(r'[\t,;]', lines[0])]
-    is_csv_or_tsv = any(f.lower() in header for f in FIELDS)
+    # Nustatome, koks skirtukas naudojamas pirmoje eilutėje (antraštėje)
+    first_line = lines[0]
+    if "\t" in first_line:
+        delimiter = "\t"
+    elif ";" in first_line:
+        delimiter = ";"
+    else:
+        delimiter = ","
 
-    for idx, line in enumerate(lines):
-        if is_csv_or_tsv and idx == 0:
-            continue  # Praleidžiame pirmąją eilutę, jei tai CSV/TSV su antrašte
+    # Sukuriame švarią antraštę (pašaliname tarpus kraštuose ir paverčiame mažosiomis raidėmis)
+    header = [col.strip().lower() for col in first_line.split(delimiter)]
+    
+    # Patikriname, ar faile tikrai yra mūsų ieškomi stulpeliai
+    has_any_field = any(f.lower() in header for f in FIELDS)
+    if not has_any_field:
+        return records  # Jei nerasta stulpelių, grąžiname tuščią sąrašą
+
+    # Skaitome duomenų eilutes
+    for line in lines[1:]:
+        # Skaidome eilutę tik pagal nustatytą skirtuką
+        parts = [p.strip() for p in line.split(delimiter)]
+        
+        row_info = {f: "Nenurodyta" for f in FIELDS}
+        
+        # Užpildome duomenis griežtai pagal stulpelių pavadinimus
+        for f in FIELDS:
+            f_lower = f.lower()
+            if f_lower in header:
+                h_idx = header.index(f_lower)
+                if h_idx < len(parts) and parts[h_idx]:
+                    row_info[f] = safe_js_string(parts[h_idx])
+
+        # Bandom paimti koordinates iš konkrečių stulpelių
+        try:
+            lat_str = row_info.get("CellId1 Latitude", "0").replace(",", ".")
+            lon_str = row_info.get("CellId1 Longitude", "0").replace(",", ".")
             
-        line_str = line.strip()
-        if not line_str:
+            lat = float(lat_str)
+            lon = float(lon_str)
+            
+            # Jei CellId1 neturi koordinačių, tikriname CellId2
+            if lat == 0 and lon == 0:
+                lat_str = row_info.get("CellId2 Latitude", "0").replace(",", ".")
+                lon_str = row_info.get("CellId2 Longitude", "0").replace(",", ".")
+                lat = float(lat_str)
+                lon = float(lon_str)
+                
+        except ValueError:
             continue
 
-        lat, lon = None, None
-        row_info = {f: "Nenurodyta" for f in FIELDS}
-
-        if is_csv_or_tsv:
-            parts = re.split(r'[\t,;]', line_str)
-            for f in FIELDS:
-                f_lower = f.lower()
-                if f_lower in header:
-                    h_idx = header.index(f_lower)
-                    if h_idx < len(parts):
-                        row_info[f] = safe_js_string(parts[h_idx])
-            
-            # Koordinates imame iš tikslių stulpelių: "CellId1 Latitude" ir "CellId1 Longitude"
-            try:
-                lat_str = row_info.get("CellId1 Latitude", "")
-                lon_str = row_info.get("CellId1 Longitude", "")
-                if lat_str and lon_str and lat_str != "Nenurodyta" and lon_str != "Nenurodyta":
-                    lat, lon = float(lat_str), float(lon_str)
-            except ValueError:
-                pass
-
-        # Jei koordinačių stulpeliuose nerasta arba formatas laisvas TXT, ieškome eilutėje reguliariuoju reiškiniu
-        if lat is None or lon is None:
-            coord_match = COORD_RE.search(line_str)
-            if coord_match:
-                try:
-                    lat, lon = float(coord_match.group(1)), float(coord_match.group(2))
-                except ValueError:
-                    continue
-            else:
-                continue
-
-        # Jei failas skaitomas kaip laisvas tekstas (ne CSV), ieškome reikšmių pagal raktinius žodžius
-        if not is_csv_or_tsv:
-            for f in FIELDS:
-                pattern = rf"{re.escape(f)}[:\s=-]*([^,\t;\n]+)"
-                match = re.search(pattern, line_str, re.IGNORECASE)
-                if match:
-                    row_info[f] = safe_js_string(match.group(1))
-
-        if lat is not None and lon is not None and (-90 <= lat <= 90 and -180 <= lon <= 180):
+        # Jei koordinatės teisingos, išsaugojame įrašą
+        if lat != 0 and lon != 0 and (-90 <= lat <= 90 and -180 <= lon <= 180):
             row_info["_lat"] = round(lat, 5)
             row_info["_lon"] = round(lon, 5)
             records.append(row_info)
@@ -113,6 +108,8 @@ def aggregate_records(records):
         # Pagrindinis adresas suvestinei imamas iš "CellId1 Address"
         if r["CellId1 Address"] != "Nenurodyta" and r["CellId1 Address"]:
             aggregated[key]["address"] = r["CellId1 Address"]
+        elif r["CellId2 Address"] != "Nenurodyta" and r["CellId2 Address"]:
+            aggregated[key]["address"] = r["CellId2 Address"]
             
     return aggregated
 
@@ -127,19 +124,22 @@ def make_leaflet_html(aggregated_data, title="Žemėlapis"):
         cnt = info["count"]
         main_addr = info["address"]
         
-        # Popup dizainas paspaudus ant taško
-        popup_html = f"<div style='min-width:340px; max-height:380px; overflow-y:auto; font-family:sans-serif; font-size:11px; line-height:1.45;'>"
-        popup_html += f"<b>Pagrindinis adresas:</b> {main_addr}<br><small><b>Koordinatės:</b> {lat}, {lon}</small><hr style='border:0; border-top:1px solid #ccc; margin: 8px 0;'>"
+        # Langas paspaudus ant taško žemėlapyje
+        popup_html = f"<div style='min-width:350px; max-height:400px; overflow-y:auto; font-family:sans-serif; font-size:11px; line-height:1.5;'>"
+        popup_html += f"<b>Adresas:</b> {main_addr}<br><small><b>Koordinatės:</b> {lat}, {lon}</small><hr style='border:0; border-top:1px solid #ccc; margin: 8px 0;'>"
         
         for idx, det in enumerate(info["details"]):
-            popup_html += f"<div style='margin-bottom:12px; padding: 6px; background: #f9f9f9; border-radius: 4px; border-left: 3px solid #0078AA;'>"
-            popup_html += f"<b style='color:#0078AA; font-size:12px;'>Sujungimas #{idx+1}</b><br style='margin-bottom:4px;'>"
+            popup_html += f"<div style='margin-bottom:12px; padding: 8px; background: #f9f9f9; border-radius: 4px; border-left: 4px solid #0078AA;'>"
+            popup_html += f"<b style='color:#0078AA; font-size:12px;'>Sujungimas #{idx+1}</b><br style='margin-bottom:6px;'>"
+            
+            # Sukame ciklą per stulpelius, kad išvestume TIKTAI juos
             for f in FIELDS:
-                if det[f] and det[f] != "Nenurodyta":
-                    popup_html += f"<b>{f}:</b> {det[f]}<br>"
+                val = det.get(f, "Nenurodyta")
+                if val and val != "Nenurodyta":
+                    popup_html += f"<b>{f}:</b> {val}<br>"
             popup_html += "</div>"
             
-        popup_html += f"<div style='margin-top:8px; font-weight:bold; font-size:12px;'>Viso sujungimų šioje vietoje: {cnt}×</div></div>"
+        popup_html += f"<div style='margin-top:8px; font-weight:bold; font-size:12px; color:#111;'>Viso sujungimų čia: {cnt}×</div></div>"
 
         safe_popup_html = json.dumps(popup_html)
 
@@ -147,7 +147,7 @@ def make_leaflet_html(aggregated_data, title="Žemėlapis"):
             f"""
             (function() {{
                 var m = L.marker([{lat}, {lon}]).addTo(map);
-                m.bindPopup({safe_popup_html}, {{maxWidth: 360}});
+                m.bindPopup({safe_popup_html}, {{maxWidth: 380}});
                 m.bindTooltip('{cnt}×', {{permanent: true, direction: 'top', className: 'count-tip'}});
             }})();
             """
@@ -167,7 +167,6 @@ def make_leaflet_html(aggregated_data, title="Žemėlapis"):
         addr_full = info["address"]
         addr_short = addr_full if len(addr_full) <= 30 else addr_full[:27] + "..."
         
-        # Suvestinės atskiri stulpeliai
         summary_html_rows += f"""
         <tr>
             <td style='max-width:140px; word-wrap:break-word;'><span title='{addr_full}'>{addr_short}</span></td>
@@ -271,7 +270,7 @@ def process_file(path: Path):
         
     records = parse_file_to_records(text)
     if not records:
-        show_error("Nerasta koordinačių ar tinkamų duomenų šiame faile.\nPatikrinkite ar failo viršuje teisingai surašyti stulpelių pavadinimai.")
+        show_error("KLAIDA: Failo pirmoje eilutėje nerasti reikalingi stulpelių pavadinimai arba duomenyse nėra koordinačių.")
         return
         
     aggregated_data = aggregate_records(records)
