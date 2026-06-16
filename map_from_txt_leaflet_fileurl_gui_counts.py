@@ -24,7 +24,32 @@ DISPLAY_FIELDS = [
     "CellId2 Latitude", "CellId2 Longitude", "plmn", "IMEI", "IMSI"
 ]
 
-# Reguliarusis reiškinys koordinačių paieškai tekste, jei stulpeliai nesuveiktų
+# Taisyklės, kaip atpažinti stulpelius (net jei jie nukirsti programos eksporte)
+FIELD_MAPPING_RULES = {
+    "Provider Name": ["provider name", "provider n", "provider"],
+    "Retain Date": ["retain date", "retain d"],
+    "aParty Number": ["aparty number", "aparty nu", "aparty"],
+    "bParty Number": ["bparty number", "bparty nu", "bparty"],
+    "Dialed Number": ["dialed number", "dialed nu"],
+    "Duration": ["duration"],
+    "Service Type": ["service type", "service ty"],
+    "Service": ["service"],
+    "Connection Type": ["connection type", "connectic"],
+    "Connection Status": ["connection status", "connectic status"],
+    "CellId1": ["cellid1"],
+    "CellId2": ["cellid2"],
+    "CellId1 Address": ["cellid1 address", "cellid1 ad"],
+    "CellId2 Address": ["cellid2 address", "cellid2 ad"],
+    "CellId1 Latitude": ["cellid1 latitude", "cellid1 lat"],
+    "CellId1 Longitude": ["cellid1 longitude", "cllid1 longitude", "cllid1 lon"],
+    "CellId2 Latitude": ["cellid2 latitude", "cellid2 lat"],
+    "CellId2 Longitude": ["cellid2 longitude", "cellid2 lo"],
+    "plmn": ["plmn"],
+    "IMEI": ["imei"],
+    "IMSI": ["imsi"]
+}
+
+# Reguliarusis reiškinys koordinačių paieškai tekste atsargai
 COORD_RE = re.compile(r"([-+]?\d{{1,3}}\.\d+)\s*[,;\s\t]\s*([-+]?\d{{1,3}}\.\d+)")
 
 def safe_js_string(text: str) -> str:
@@ -44,61 +69,59 @@ def find_column_index(header_parts, targets):
     return None
 
 def parse_file_to_records(text: str):
-    """Nuskaito duomenis, lanksčiai ieškodamas koordinačių CellId1 arba CellId2 laukuose."""
+    """Praleidžia šiukšles failo pradžioje, suranda antraštę ir nuskaito tikruosius duomenis."""
     records = []
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         return records
 
-    first_line = lines[0]
-    delimiter = "\t" if "\t" in first_line else (";" if ";" in first_line else ",")
-    header_parts = [p.strip() for p in first_line.split(delimiter)]
-    
-    # Prisitaikome prie tavo stulpelių pavadinimų variantų iš nuotraukų
-    field_mapping_rules = {
-        "Provider Name": ["provider name", "provider n", "provider"],
-        "Retain Date": ["retain date", "retain d"],
-        "aParty Number": ["aparty number", "aparty nu"],
-        "bParty Number": ["bparty number", "bparty nu"],
-        "Dialed Number": ["dialed number", "dialed nu"],
-        "Duration": ["duration"],
-        "Service Type": ["service type", "service ty"],
-        "Service": ["service"],
-        "Connection Type": ["connection type", "connectic"],
-        "Connection Status": ["connection status", "connectic status"],
-        "CellId1": ["cellid1"],
-        "CellId2": ["cellid2"],
-        "CellId1 Address": ["cellid1 address", "cellid1 ad"],
-        "CellId2 Address": ["cellid2 address", "cellid2 ad"],
-        "CellId1 Latitude": ["cellid1 latitude", "cellid1 lat"],
-        "CellId1 Longitude": ["cellid1 longitude", "cllid1 longitude", "cllid1 lon"],
-        "CellId2 Latitude": ["cellid2 latitude", "cellid2 lat"],
-        "CellId2 Longitude": ["cellid2 longitude", "cellid2 lo"],
-        "plmn": ["plmn"],
-        "IMEI": ["imei"],
-        "IMSI": ["imsi"]
-    }
-    
+    header_idx = -1
+    delimiter = "\t"
     field_map = {}
-    for field_key, aliases in field_mapping_rules.items():
-        idx = find_column_index(header_parts, aliases)
-        if idx is not None:
-            field_map[field_key] = idx
 
-    for line in lines[1:]:
+    # 1 ŽINGSNIS: Ieškome, kurioje eilutėje slepiasi lentelės antraštė
+    for idx, line in enumerate(lines):
+        # Nustatome skirtuką konkrečiai eilutei
+        current_delim = "\t" if "\t" in line else (";" if ";" in line else ",")
+        parts = [p.strip().lower() for p in line.split(current_delim)]
+        
+        # Patikriname, kiek žinomų stulpelių pavyksta surasti šioje eilutėje
+        found_count = 0
+        temp_map = {}
+        for field_key, aliases in FIELD_MAPPING_RULES.items():
+            col_idx = find_column_index(parts, aliases)
+            if col_idx is not None:
+                temp_map[field_key] = col_idx
+                found_count += 1
+        
+        # Jeigu eilutėje radome bent 3 esminius stulpelius (pvz., Provider, aParty, CellId), 
+        # laikome, kad tai yra tikroji lentelės pradžia
+        if found_count >= 3:
+            header_idx = idx
+            delimiter = current_delim
+            field_map = temp_map
+            break
+
+    # Jei per visą failą neradome jokios prasmingos antraštės
+    if header_idx == -1:
+        return records
+
+    # 2 ŽINGSNIS: Skaitome duomenis TIK nuo surastos antraštės žemyn
+    for line in lines[header_idx + 1:]:
         parts = [p.strip() for p in line.split(delimiter)]
         if len(parts) < 2:
             continue
             
         row_info = {f: "Nenurodyta" for f in DISPLAY_FIELDS}
         
+        # Užpildome duomenų žodyną pagal surastus indeksus
         for field_key, col_idx in field_map.items():
             if col_idx < len(parts) and parts[col_idx]:
                 row_info[field_key] = safe_js_string(parts[col_idx])
         
         lat, lon = None, None
 
-        # 1 STRATEGIJA: Tikriname CellId1 koordinates
+        # Bandome gauti koordinates iš CellId1 stulpelių
         try:
             l1 = row_info.get("CellId1 Latitude", "Nenurodyta")
             o1 = row_info.get("CellId1 Longitude", "Nenurodyta")
@@ -108,7 +131,7 @@ def parse_file_to_records(text: str):
         except ValueError:
             lat, lon = None, None
 
-        # 2 STRATEGIJA: Jei CellId1 tuščias/netinkamas, tikriname CellId2 koordinates
+        # Jei CellId1 tuščias/nulinis, imame CellId2 koordinates (kaip tavo pavyzdyje)
         if lat is None or lon is None or lat == 0:
             try:
                 l2 = row_info.get("CellId2 Latitude", "Nenurodyta")
@@ -119,7 +142,7 @@ def parse_file_to_records(text: str):
             except ValueError:
                 lat, lon = None, None
 
-        # 3 STRATEGIJA: Jei stulpeliuose tuščia, ieškome bet kur eilutės tekste
+        # Jei stulpeliuose koordinačių nėra, bet jos įrašytos kaip laisvas tekstas, ieškome reguliariuoju reiškiniu
         if lat is None or lon is None or lat == 0:
             match = COORD_RE.search(line)
             if match:
@@ -129,7 +152,7 @@ def parse_file_to_records(text: str):
                 except ValueError:
                     continue
 
-        # Jei koordinačių rasti nepavyko, šią eilutę praleidžiame
+        # Jei jokių koordinačių šioje eilutėje rasti nepavyko, ją praleidžiame
         if lat is None or lon is None or lat == 0:
             continue
 
@@ -149,7 +172,7 @@ def aggregate_records(records):
         aggregated[key]["count"] += 1
         aggregated[key]["details"].append(r)
         
-        # Sumanus adreso parinkimas suvestinei: pirmenybė CellId1, jei tuščia – CellId2
+        # Parenkame adresą suvestinei iš CellId1 arba CellId2
         c1_addr = r.get("CellId1 Address", "Nenurodyta")
         c2_addr = r.get("CellId2 Address", "Nenurodyta")
         
@@ -315,7 +338,7 @@ def process_file(path: Path):
         
     records = parse_file_to_records(text)
     if not records:
-        show_error("KLAIDA: Failo struktūra neatitinka reikalavimų arba jame visiškai nėra koordinačių.")
+        show_error("KLAIDA: Failo turinyje nepavyko rasti lentelės su stulpelių pavadinimais arba duomenyse nėra koordinačių.")
         return
         
     aggregated_data = aggregate_records(records)
